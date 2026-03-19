@@ -5,7 +5,7 @@ A collection of cybersecurity tools built in Python as part of my learning journ
 
 Each tool was built from scratch to understand the underlying concepts — not copied. The `basic/` and `advanced/` versions in each folder show my progression.
 
----
+```
 
 ## 📁 Repository Structure
 ---
@@ -27,7 +27,7 @@ python-security-tools/
 │   └── notes.md                  ← what I learned building this
 │
 └── README.md                     ← this file
----
+```
 
 ## 🛠️ Tools Overview
 
