@@ -8,7 +8,7 @@ Each tool was built from scratch to understand the underlying concepts — not c
 ---
 
 ## 📁 Repository Structure
-
+---
 python-security-tools/
 │
 ├── password-checker/
@@ -27,7 +27,7 @@ python-security-tools/
 │   └── notes.md                  ← what I learned building this
 │
 └── README.md                     ← this file
-
+---
 
 ## 🛠️ Tools Overview
 
