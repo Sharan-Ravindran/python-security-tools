@@ -1,210 +1,290 @@
-
-# 📝 Notes — Web Vulnerability Scanner
-
-Personal notes written while building this tool. Connects directly to what I did manually during my internship.
-
----
-
-## Core concepts
-
-### What is XSS (Cross-Site Scripting)?
-
-A vulnerability where an attacker can inject JavaScript into a web page that runs in another user's browser.
-
-How it happens:
-```
-User input:   <script>alert('hacked')</script>
-App stores/reflects it without sanitising
-Browser sees: <script>alert('hacked')</script>
-Browser runs: the JavaScript — popup appears (or worse, steals cookies)
-```
-
-Three types:
-- **Reflected XSS** — payload in URL, reflected immediately in response. What this scanner detects.
-- **Stored XSS** — payload saved in database, affects everyone who views that page. Harder to detect automatically.
-- **DOM-based XSS** — payload processed by JavaScript in the browser. Not detectable by reading server responses.
-
-Common XSS test payloads:
-```
-<script>alert(1)</script>
-<img src=x onerror=alert(1)>
-"><script>alert(1)</script>
-```
-
-How to detect reflected XSS in code:
-```python
-payload = "<script>alert('xss')</script>"
-response = requests.get(url + payload)
-if payload in response.text:
-    print("Potentially vulnerable to XSS")
-```
-
----
-
-### What is SQL Injection?
-
-A vulnerability where user input gets inserted directly into a SQL query without sanitisation.
-
-How it happens:
-```python
-# Vulnerable code (never do this):
-query = "SELECT * FROM users WHERE id = " + user_input
-
-# Attacker enters: 1' OR '1'='1
-# Query becomes:  SELECT * FROM users WHERE id = 1' OR '1'='1
-# This returns ALL users instead of just id=1
-```
-
-Common SQLi test payloads:
-```
-'
-1'
-1 OR 1=1
-' OR '1'='1
-```
-
-Error-based detection — look for these strings in the response:
-```
-sql syntax
-mysql_fetch
-ORA-01756
-Microsoft OLE DB
-SQLite3::
-PostgreSQL
-Warning: pg_
-```
-
-If any of these appear after injecting `'` into a parameter, the app is likely vulnerable.
-
----
-
-## requests library
-
-```python
 import requests
-
-# GET request (like typing URL in browser)
-response = requests.get("http://example.com/page?id=1")
-
-# POST request (like submitting a form)
-data = {"username": "admin", "password": "test"}
-response = requests.post("http://example.com/login", data=data)
-
-# Useful response attributes:
-response.text         # HTML content as string
-response.status_code  # 200 = OK, 404 = not found, 500 = server error
-response.url          # final URL after redirects
-response.headers      # HTTP headers dict
-```
-
----
-
-## Extracting links from HTML
-
-Simple way using regex:
-
-```python
-import re
-
-html = response.text
-links = re.findall(r'href=["\'](.*?)["\']', html)
-```
-
-More complete way using BeautifulSoup (more reliable):
-
-```python
 from bs4 import BeautifulSoup
+from urllib.parse import urljoin, urlparse
+from datetime import datetime
 
-soup = BeautifulSoup(html, "html.parser")
-links = [a['href'] for a in soup.find_all('a', href=True)]
-forms = soup.find_all('form')
-```
+XSS_PAYLOADS = [
+    "<script>alert('xss')</script>",
+    "<img src=x onerror=alert(1)>",
+    '"><script>alert(1)</script>',
+    "'><script>alert(1)</script>",
+]
+SQLI_PAYLOADS = [
+    "'",
+    "1' OR '1'='1",
+    "' OR 1=1--",
+    "1; DROP TABLE users--",
+]
+SQLI_ERRORS = [
+    "you have an error in your sql syntax",
+    "warning: mysql",
+    "unclosed quotation mark",
+    "quoted string not properly terminated",
+    "mysql_fetch",
+    "ora-01756",
+    "microsoft ole db",
+    "sqlite3::",
+    "postgresql",
+    "pg_query",
+]
+def get_all_forms(url, session):
+    """Find all forms on a page and return them as a list"""
+    try:
+        response = session.get(url, timeout=5)
+        soup = BeautifulSoup(response.text, "html.parser")
+        return soup.find_all("form")
+    except requests.RequestException:
+        return []
 
----
 
-## Extracting form fields
+def get_form_details(form):
+    """
+    Extract useful info from a form element.
+    Returns a dict with action, method, and list of inputs.
+    """
+    details = {}
+    details["action"] = form.attrs.get("action", "")
+    details["method"] = form.attrs.get("method", "get").lower()
+    inputs = []
+    for input_tag in form.find_all(["input", "textarea", "select"]):
+        input_type = input_tag.attrs.get("type", "text")
+        input_name = input_tag.attrs.get("name")
+        input_value = input_tag.attrs.get("value", "test")
 
-Forms are how web apps take input — they need to be found and tested:
+        if input_name:  
+            inputs.append({
+                "type": input_type,
+                "name": input_name,
+                "value": input_value
+            })
 
-```python
-from bs4 import BeautifulSoup
+    details["inputs"] = inputs
+    return details
 
-soup = BeautifulSoup(html, "html.parser")
-forms = soup.find_all("form")
+def submit_form(form_details, base_url, payload, session):
+    """
+    Submit a form with a payload injected into every text field.
+    Returns the response.
+    """
+    target_url = urljoin(base_url, form_details["action"])
 
-for form in forms:
-    action = form.get("action")    # where the form submits to
-    method = form.get("method", "get").lower()   # GET or POST
-    inputs = form.find_all("input")
+    data = {}
+    for input_field in form_details["inputs"]:
+        if input_field["type"] in ("text", "search", "email", "password", "textarea"):
+            data[input_field["name"]] = payload 
+        else:
+            data[input_field["name"]] = input_field["value"] 
+
+    try:
+        if form_details["method"] == "post":
+            return session.post(target_url, data=data, timeout=5)
+        else:
+            return session.get(target_url, params=data, timeout=5)
+    except requests.RequestException:
+        return None
     
-    for input_field in inputs:
-        name = input_field.get("name")    # parameter name
-        type_ = input_field.get("type")   # text, password, hidden etc.
-```
+def check_xss_in_url(url, session):
+    """Test XSS by injecting payloads into URL parameters"""
+    findings = []
+    parsed = urlparse(url)
+    if not parsed.query:
+        return findings   
 
----
+    for payload in XSS_PAYLOADS:
+        test_url = url
+        try:
+            response = session.get(test_url + payload, timeout=5)
+            if payload in response.text:
+                findings.append({
+                    "type": "XSS",
+                    "url": test_url,
+                    "payload": payload,
+                    "method": "URL parameter"
+                })
+                break 
+        except requests.RequestException:
+            continue
 
-## Why sanitisation prevents XSS
+    return findings
 
-Vulnerable:
-```python
-output = "<p>Hello " + user_input + "</p>"
-# if user_input = <script>alert(1)</script>
-# output = <p>Hello <script>alert(1)</script></p>  ← runs JS
-```
+def check_xss_in_forms(url, session):
+    """Test XSS by injecting payloads into form fields"""
+    findings = []
+    forms = get_all_forms(url, session)
 
-Fixed with HTML escaping:
-```python
-import html
-output = "<p>Hello " + html.escape(user_input) + "</p>"
-# if user_input = <script>alert(1)</script>
-# output = <p>Hello &lt;script&gt;alert(1)&lt;/script&gt;</p>  ← displays as text, not code
-```
+    for form in forms:
+        form_details = get_form_details(form)
 
----
+        for payload in XSS_PAYLOADS:
+            response = submit_form(form_details, url, payload, session)
+            if response and payload in response.text:
+                findings.append({
+                    "type": "XSS",
+                    "url": url,
+                    "payload": payload,
+                    "method": f"Form ({form_details['method'].upper()})"
+                })
+                break
 
-## Why parameterised queries prevent SQLi
+    return findings
 
-Vulnerable:
-```python
-query = "SELECT * FROM users WHERE id = " + user_input
-cursor.execute(query)
-```
 
-Fixed:
-```python
-query = "SELECT * FROM users WHERE id = ?"
-cursor.execute(query, (user_input,))   # input is treated as data, not SQL code
-```
+def check_sqli_in_url(url, session):
+    """Test SQLi by injecting payloads into URL parameters"""
+    findings = []
 
-The `?` is a placeholder — the database driver handles escaping. User input can never break out of the data context.
+    parsed = urlparse(url)
+    if not parsed.query:
+        return findings
 
----
+    for payload in SQLI_PAYLOADS:
+        try:
+            response = session.get(url + payload, timeout=5)
 
-## Things I got wrong first time
+            response_lower = response.text.lower()
+            for error in SQLI_ERRORS:
+                if error in response_lower:
+                    findings.append({
+                        "type": "SQLi",
+                        "url": url,
+                        "payload": payload,
+                        "method": "URL parameter",
+                        "error_found": error
+                    })
+                    break
 
-- Didn't handle redirects — `requests` follows them automatically which is usually fine
-- Tested on URLs without query parameters — XSS/SQLi need somewhere to inject
-- Didn't set a timeout on requests — scanner hung on slow/dead hosts
-- Forgot to URL-encode payloads — some payloads need encoding to survive in a URL
+        except requests.RequestException:
+            continue
 
-Always add timeout to requests:
-```python
-response = requests.get(url, timeout=5)
-```
+    return findings
 
----
 
-## Connection to internship work
+def check_sqli_in_forms(url, session):
+    """Test SQLi by injecting payloads into form fields"""
+    findings = []
+    forms = get_all_forms(url, session)
 
-I found XSS and SQLi manually in the OWASP Juice Shop by entering payloads in the browser and checking if they were reflected. This tool does the same thing programmatically. Building it made me understand exactly what Burp Suite's active scanner is doing under the hood — it's the same logic, just more comprehensive payloads and smarter detection.
+    for form in forms:
+        form_details = get_form_details(form)
 
-During my web application pentest (major project) I used Burp Suite's scanner — now I understand what it's doing at the code level.
+        for payload in SQLI_PAYLOADS:
+            response = submit_form(form_details, url, payload, session)
+            if response:
+                response_lower = response.text.lower()
+                for error in SQLI_ERRORS:
+                    if error in response_lower:
+                        findings.append({
+                            "type": "SQLi",
+                            "url": url,
+                            "payload": payload,
+                            "method": f"Form ({form_details['method'].upper()})",
+                            "error_found": error
+                        })
+                        break
 
----
+    return findings
 
-## Resources
-- OWASP XSS: owasp.org/www-community/attacks/xss
-- OWASP SQLi: owasp.org/www-community/attacks/SQL_Injection
-- requests library docs: docs.python-requests.org
-- BeautifulSoup docs: beautiful-soup-4.readthedocs.io
+def crawl(base_url, session, max_urls=20):
+    """
+    Find all links on the target site that belong to the same domain.
+    Returns a list of URLs to scan.
+    """
+    visited = set()
+    to_visit = [base_url]
+    found_urls = []
+
+    base_domain = urlparse(base_url).netloc 
+
+    while to_visit and len(found_urls) < max_urls:
+        url = to_visit.pop(0)
+
+        if url in visited:
+            continue
+
+        visited.add(url)
+
+        try:
+            response = session.get(url, timeout=5)
+            found_urls.append(url)
+
+            soup = BeautifulSoup(response.text, "html.parser")
+
+            for link in soup.find_all("a", href=True):
+                full_url = urljoin(url, link["href"])
+
+                if urlparse(full_url).netloc == base_domain:
+                    if full_url not in visited:
+                        to_visit.append(full_url)
+
+        except requests.RequestException:
+            continue
+
+    return found_urls
+
+print("=" * 60)
+print("        WEB VULNERABILITY SCANNER")
+print("        Educational use and authorised testing only")
+print("=" * 60)
+
+target = input("\nEnter target URL (e.g. http://localhost:3000): ").strip()
+if not target.startswith("http"):
+    target = "http://" + target
+
+session = requests.Session()
+session.headers["User-Agent"] = "Mozilla/5.0 (Security Scanner — Educational)"
+
+print(f"\n[*] Starting scan of: {target}")
+print(f"[*] Time: {datetime.now().strftime('%H:%M:%S')}")
+print(f"\n[*] Crawling for pages to test...")
+
+urls = crawl(target, session, max_urls=20)
+print(f"[*] Found {len(urls)} pages to test\n")
+print("-" * 60)
+
+all_findings = []
+
+for url in urls:
+    print(f"[*] Testing: {url}")
+
+    findings = []
+    findings += check_xss_in_url(url, session)
+    findings += check_xss_in_forms(url, session)
+    findings += check_sqli_in_url(url, session)
+    findings += check_sqli_in_forms(url, session)
+
+    if findings:
+        for f in findings:
+            if f["type"] == "XSS":
+                print(f"  [!!] XSS FOUND via {f['method']}")
+                print(f"       Payload: {f['payload']}")
+            elif f["type"] == "SQLi":
+                print(f"  [!!] SQLi FOUND via {f['method']}")
+                print(f"       Payload: {f['payload']}")
+                print(f"       Error:   {f['error_found']}")
+        all_findings += findings
+    else:
+        print(f"  [-] No issues found")
+
+xss_count  = sum(1 for f in all_findings if f["type"] == "XSS")
+sqli_count = sum(1 for f in all_findings if f["type"] == "SQLi")
+
+print("\n" + "=" * 60)
+print("SCAN COMPLETE")
+print(f"Pages tested         : {len(urls)}")
+print(f"XSS vulnerabilities  : {xss_count}")
+print(f"SQLi vulnerabilities : {sqli_count}")
+print(f"Total findings       : {len(all_findings)}")
+print("=" * 60)
+
+if all_findings:
+    print("\nFINDINGS SUMMARY")
+    print("-" * 60)
+    for i, f in enumerate(all_findings, 1):
+        print(f"{i}. [{f['type']}] {f['url']}")
+        print(f"   Method : {f['method']}")
+        print(f"   Payload: {f['payload']}")
+        print()
+
+
+
+
