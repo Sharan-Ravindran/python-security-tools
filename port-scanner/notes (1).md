@@ -1,187 +1,69 @@
-# 📝 Notes — Port Scanner
+# Port Scanner: Concepts Notes
 
-Personal notes written while building both versions of this tool.
+## Socket concepts
 
----
+### How the socket scanner works
+- Uses Python's built-in `socket` module to attempt a raw TCP connection to each port on the target host.
+- `socket.connect_ex((host, port))` attempts the connection and returns an integer instead of raising an exception — `0` means the port is open; any other value means it's closed or filtered.
+- `socket.settimeout(n)` caps how long the program waits on a single unresponsive port, so the scan doesn't hang indefinitely.
+- Ports are scanned **one at a time, in sequence** — the program fully waits for each connection attempt to resolve before starting the next.
 
-## Core concept — what is a port scan?
+### Why it's slow
+- Port scanning is I/O-bound: almost all the time is spent waiting for the OS/network to respond, not doing any actual computation.
+- Doing this sequentially means the CPU sits idle for the vast majority of the scan. Scanning 1,000 ports at a 0.5s timeout each could take 8+ minutes in the worst case, even though there's barely any real work happening.
+- This bottleneck — waiting, not computing — is exactly what concurrency (threading/asyncio) is built to fix.
 
-A TCP port scanner tries to complete a TCP handshake with every port on a target.
-
-Normal TCP connection (3-way handshake):
-```
-Client  →  SYN        →  Server
-Client  ←  SYN-ACK    ←  Server   (port is OPEN)
-Client  →  ACK        →  Server
-```
-
-If no SYN-ACK comes back — port is CLOSED or FILTERED.
-
-A port scanner just automates this for every port number (1–65535).
-
----
-
-## socket module
-
-`socket` is Python's built-in networking library. It lets you open raw network connections.
-
-```python
-import socket
-
-sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-```
-
-Breaking this down:
-- `socket.AF_INET` — use IPv4 addresses (like 192.168.1.1)
-- `socket.SOCK_STREAM` — use TCP (reliable, connection-based)
-- If you wanted UDP you'd use `SOCK_DGRAM` instead
-
----
-
-## connect_ex() vs connect()
-
-Two ways to attempt a connection:
-
-```python
-sock.connect((host, port))      # throws exception if fails — bad for scanning
-sock.connect_ex((host, port))   # returns 0 if open, non-zero if closed — good for scanning
-```
-
-Always use `connect_ex()` in a scanner because you EXPECT most ports to fail — you don't want an exception every time.
-
-Return values of `connect_ex()`:
-- `0` = connection successful = port is OPEN
-- anything else = connection failed = port is CLOSED or filtered
-
----
-
-## settimeout()
-
-```python
-sock.settimeout(1)   # wait max 1 second before giving up
-```
-
-Without this: scanner hangs for a very long time on filtered ports (firewall drops the packet silently, no response ever comes).
-
-With this: moves on after 1 second. Adjust lower (0.5) for speed, higher for accuracy on slow networks.
-
----
-
-## gethostbyname()
-
-Converts a hostname to an IP address:
-
-```python
-ip = socket.gethostbyname("scanme.nmap.org")
-# returns "45.33.32.156"
-```
-
-Wrap in try/except because it throws `socket.gaierror` if hostname can't be resolved.
-
----
+### Key takeaway
+This version exists to prove the raw mechanics of a TCP connect scan before adding any concurrency on top.
 
 ## Threading concepts
 
 ### Why threading?
-Without threading: scan port 1 → wait → scan port 2 → wait → ... very slow
-With threading: 100 workers each scanning a different port simultaneously → fast
+- Since scanning is I/O-bound, many connection attempts can happen *at the same time* instead of one after another — while one thread is waiting on a response, another can be actively attempting a different port.
+- Python's `threading` module spins up multiple threads, each independently attempting a connection to a different port.
 
-### threading.Thread
-```python
-t = threading.Thread(target=function, args=(arg1, arg2))
-t.start()   # starts the thread running
-t.join()    # waits for thread to finish before continuing
-```
+### Core components
+- `threading.Thread` — creates a new thread that runs the port-check function independently of the main program.
+- `queue.Queue` — a thread-safe structure that hands out ports to worker threads one at a time. Each thread pulls a port, scans it, and goes back for the next — this avoids two threads accidentally scanning the same port or needing manual locking to divide the work.
+- A **fixed pool** of worker threads (e.g. 50–100) is used instead of one thread per port — spawning thousands of OS threads has its own overhead and can slow the scan down or crash it.
 
-### t.daemon = True
-```python
-t.daemon = True
-```
-If the main program exits (e.g. you press Ctrl+C), daemon threads die automatically.
-Without this: threads keep running in the background even after the program "ends".
+### The GIL caveat
+- Python's Global Interpreter Lock (GIL) means only one thread executes Python bytecode at a time — threading in Python does **not** give true CPU parallelism.
+- This doesn't hurt a port scanner because the threads spend almost all their time *waiting* on network I/O, not running Python code. While one thread is blocked on a socket call, the GIL is released and another thread runs. So threading is still a genuine speedup for I/O-bound work like this — just not for CPU-heavy work.
 
-### Queue — the ticket dispenser
-```python
-from queue import Queue
+### Key takeaway
+Threading turns a sequential, wait-heavy scan into a concurrent one — the GIL doesn't matter here because the bottleneck was always network latency, never the CPU.
 
-queue = Queue()
-queue.put(80)       # add port 80 to queue
-queue.put(443)      # add port 443 to queue
+## Asyncio concepts
 
-port = queue.get()  # grab next item (80)
-queue.task_done()   # tell queue I finished with this item
-```
+### Why asyncio?
+Threading creates multiple OS threads to perform work concurrently. `asyncio` instead uses an **event loop** to manage many asynchronous tasks, allowing the program to efficiently handle lots of I/O operations without creating a thread for every operation. This is especially useful for network programs because most of the time is spent **waiting for network responses**.
 
-Every thread calls `queue.get()` to grab its next port. Queue handles the coordination — two threads never grab the same port.
+**Without concurrency:** each port is scanned one at a time, and the program is fully blocked while waiting for every single connection attempt to finish.
 
-Always call `queue.task_done()` after finishing each item. Use `finally` to make sure it runs even if an error happens:
+**With threading:** multiple OS threads run "concurrently," but each individual thread still fully blocks while waiting on its own connection — the OS is just switching between threads to create the illusion of simultaneity.
 
-```python
-try:
-    # do the scan
-    pass
-finally:
-    queue.task_done()   # always runs, even on error
-```
+**With asyncio:** a single thread runs an event loop that juggles many coroutines. When a coroutine hits an `await` (e.g. waiting on a connection), it yields control straight back to the event loop, which immediately finds another coroutine to run instead of sitting idle. Nothing is ever truly blocked — so far more connection attempts can be "in flight" at once than a thread-per-connection model could manage.
 
-### threading.Lock
-Problem without lock:
-```
-Thread 1: print("[OPEN] Port
-Thread 2: print("[OPEN] Port      ← interrupts mid-line
-Thread 1: 80 | HTTP")
-```
-Output becomes garbled.
+### Core components
+- `async def` — defines a coroutine function instead of a regular function.
+- `await` — pauses the coroutine at an I/O point and hands control back to the event loop until that operation completes.
+- `asyncio.open_connection(host, port)` — the asyncio equivalent of `socket.connect_ex()`; attempts a connection without blocking the whole program.
+- `asyncio.wait_for(coro, timeout)` — the asyncio equivalent of `socket.settimeout()`, so one stuck connection can't hang the entire scan.
+- `asyncio.gather(*tasks)` — runs many coroutines concurrently and waits for all of them to complete.
 
-Solution:
-```python
-print_lock = threading.Lock()
+### Threading vs. asyncio — which is actually faster?
+- For a pure port scanner (short-lived, I/O-bound connections), asyncio is usually faster and lighter at scale — an event loop juggling thousands of coroutines has far less overhead than the OS managing thousands of threads (each OS thread carries real memory and context-switching cost that a coroutine doesn't).
+- Threading is easier to reason about for smaller scans since the code reads more like normal sequential code.
+- Asyncio scales better for large port ranges or large IP ranges, which is why most modern, high-performance scanners lean on async I/O under the hood.
 
-with print_lock:
-    print(f"[OPEN] Port {port}")   # only one thread prints at a time
-```
+### Key takeaway
+Asyncio solves the same core problem as threading — don't sit idle waiting on I/O — but does it with one thread and cooperative multitasking instead of many OS threads, which is why it tends to win as the scan gets bigger.
 
-`with print_lock:` automatically acquires and releases the lock.
+## Quick comparison
 
----
-
-## Things I got wrong first time
-
-- Forgot `sock.close()` after each scan — ran out of available sockets
-- Forgot `queue.task_done()` — program hung at the end waiting forever
-- Didn't use `with print_lock:` — output was jumbled with multiple threads
-- Set timeout too high (3 seconds) — scan was still slow even with threads
-- Forgot `t.join()` — program printed summary before threads finished scanning
-
----
-
-## Common port numbers to memorise
-
-```
-21   FTP        (file transfer)
-22   SSH        (secure remote access)
-23   Telnet     (insecure remote access — red flag if open)
-25   SMTP       (email sending)
-53   DNS        (domain name resolution)
-80   HTTP       (websites)
-443  HTTPS      (secure websites)
-445  SMB        (Windows file sharing — common attack target)
-3306 MySQL      (database)
-3389 RDP        (Windows remote desktop — common attack target)
-```
-
----
-
-## Connection to Nmap
-
-Nmap's `-sT` flag is a TCP connect scan — exactly what this tool does.
-Nmap's `-sS` (SYN scan) sends only the SYN packet and listens for SYN-ACK without completing the handshake — stealthier but requires root/admin.
-
-This tool does a full connect scan (like `-sT`) because completing the handshake doesn't require special privileges.
-
----
-
-## Resources
-- Python socket docs: docs.python.org/3/library/socket.html
-- Python threading docs: docs.python.org/3/library/threading.html
-- Nmap port scanning techniques: nmap.org/book/man-port-scanning-techniques.html
+| Approach | Concurrency model | Best for | Main limitation |
+|---|---|---|---|
+| Basic socket | None (sequential) | Understanding the raw mechanics | Very slow at scale |
+| Threading | Multiple OS threads | Small–medium scans, simpler mental model | Thread overhead at large scale |
+| Asyncio | Single-threaded event loop | Large scans, many concurrent connections | More complex to reason about/debug |
