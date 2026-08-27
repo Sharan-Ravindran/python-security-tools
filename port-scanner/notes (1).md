@@ -80,7 +80,7 @@ Wrap in try/except because it throws `socket.gaierror` if hostname can't be reso
 
 ---
 
-## Threading concepts (advanced version)
+## Threading concepts
 
 ### Why threading?
 Without threading: scan port 1 → wait → scan port 2 → wait → ... very slow
